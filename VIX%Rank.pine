@@ -1,0 +1,25 @@
+//@version=5
+indicator("VIX Relative Percentiles", overlay=false)
+
+// 設定觀察窗口（例如 126 trading days ≈ 6 個月）
+length = input.int(50, "Lookback Period")
+
+// 分位數設置
+low_pctl  = input.float(0.2, "Lower Percentile (20%)")
+mid_pctl  = input.float(0.5, "Median Percentile (50%)")
+high_pctl = input.float(0.8, "Upper Percentile (80%)")
+
+// 計算過去 length 期間 VIX 嘅最大值、最小值
+vix_high = ta.highest(close, length)
+vix_low  = ta.lowest(close, length)
+
+// 動態分位數
+vix_low_th  = vix_low + (vix_high - vix_low) * low_pctl
+vix_mid_th  = vix_low + (vix_high - vix_low) * mid_pctl
+vix_high_th = vix_low + (vix_high - vix_low) * high_pctl
+
+// 繪圖
+plot(close, color=color.blue, title="VIX")
+plot(vix_low_th,  color=color.green, title="20% Percentile")
+plot(vix_mid_th,  color=color.orange, title="50% Percentile")
+plot(vix_high_th, color=color.red, title="80% Percentile")

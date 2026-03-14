@@ -1,0 +1,41 @@
+//@version=6
+indicator("PCCE Percentile Rank (Hunter Logic)", shorttitle="PCCE %Rank", overlay=false)
+
+// ============================
+// Parameters 
+// ============================
+symCPC       = input.symbol("USI:PCCE", "Equity Put/Call Ratio (PCCE)")
+cpcSmoothLen = input.int(5, "PCCE Smoothing EMA (1=Off)", minval=1, maxval=50)
+cpcLb        = input.int(252, "PCCE rank lookback (days)", minval=20, maxval=252)
+
+// 門檻設定 (轉做 0-100)
+cpcHiPctRank = input.float(0.80, "BUY: PCCE rank >= (fear)", 0.5, 0.99) * 100
+cpcLoPctRank = input.float(0.20, "SELL: PCCE rank <= (greed)", 0.01, 0.5) * 100
+
+// ============================
+// Core Logic: PCCE Percentile 
+// ============================
+cpcVal = (cpcSmoothLen > 1) ? ta.ema(close, cpcSmoothLen) : close
+
+cpcPct = request.security(
+     symCPC,
+     "D",
+     ta.percentrank(cpcVal, cpcLb),
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off
+)
+
+// ============================
+// Visuals & Plots
+// ============================
+plot_cpc = plot(cpcPct, title="PCCE %Rank", color=color.new(color.blue, 0), linewidth=2)
+
+// 上方 80% 恐慌區（買入訊號）改為綠色
+plot_hi = plot(cpcHiPctRank, title="Fear Threshold (BUY)", color=color.new(color.green, 30), style=plot.style_line)
+fill(plot_cpc, plot_hi, cpcPct >= cpcHiPctRank ? color.new(color.green, 80) : na, title="Buy Zone Fill")
+
+// 下方 20% 貪婪區（沽出訊號）改為紅色
+plot_lo = plot(cpcLoPctRank, title="Greed Threshold (SELL)", color=color.new(color.red, 30), style=plot.style_line)
+fill(plot_cpc, plot_lo, cpcPct <= cpcLoPctRank ? color.new(color.red, 80) : na, title="Sell Zone Fill")
+
+hline(50, title="Neutral (50%)", color=color.new(color.gray, 50), linestyle=hline.style_dotted)
