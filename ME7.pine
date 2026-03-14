@@ -1,0 +1,557 @@
+//@version=6
+// NOTE: request.security() calls below use named args (gaps/lookahead) for better forward-compatibility.
+indicator("Hunter Protocol", overlay=true)
+
+// ============================
+// Symbols
+// ============================
+symSPY  = input.symbol("SPX",  "Benchmark (price anchor)")
+symVIX  = input.symbol("VIX",  "VIX (Volatility)")
+// [修改 1] 改用 PCCE
+symCPC  = input.symbol("PCCE", "Equity Put/Call Ratio (PCCE)")
+
+symS5TW = input.symbol("S5TW", "Breadth %>20DMA (S5TW)")
+symS5FI = input.symbol("S5FI", "Breadth %>50DMA (S5FI)")
+symS5TH = input.symbol("S5TH", "Breadth %>200DMA (S5TH)")
+
+// ============================
+// Data (External)
+// ============================
+groupExt = "Data (External)"
+symHYG   = input.symbol("HYG",   "HYG - High Yield Bond ETF", group=groupExt)
+symTLT   = input.symbol("TLT",   "TLT - 20+ Year Treasury Bond ETF", group=groupExt)
+symVIX3M = input.symbol("VIX3M", "VIX3M - CBOE 3-Month Volatility Index", group=groupExt)
+
+// ============================
+// Parameters
+// ============================
+// VIX
+vixLb    = input.int(50,  "VIX rank lookback (days)", minval=20, maxval=252)
+vixHiPct = input.float(0.80, "BUY: VIX rank >= (fear)", 0.5, 0.99)
+vixLoPct = input.float(0.20, "SELL: VIX rank <= (greed)", 0.01, 0.5)
+
+// PCCE (Smoothing Enabled)
+cpcSmoothLen = input.int(5, "PCCE Smoothing EMA (1=Off)", minval=1, maxval=50)
+cpcMode      = input.string("Percentile", "PCCE filter mode", options = ["Absolute", "Percentile"])
+// [修改 1] 調整 Thresholds
+cpcHiAbs     = input.float(0.95, "BUY: PCCE > (fear, absolute)", 0.5, 2.0)
+cpcLoAbs     = input.float(0.55, "SELL: PCCE < (greed, absolute)", 0.1, 1.0)
+cpcLb        = input.int(252, "PCCE rank lookback (days)", minval=20, maxval=252)
+cpcHiPctRank = input.float(0.80, "BUY: PCCE rank >= (fear)", 0.5, 0.99)
+cpcLoPctRank = input.float(0.20, "SELL: PCCE rank <= (greed)", 0.01, 0.5)
+
+// Breadth
+weakThrInp = input.float(20.0, "Bear/Crash Washout (Default 20)", 0, 100)
+hotThrInp  = input.float(80.0, "Breadth overheat threshold (>=)", 0, 100)
+
+// ============================
+// 🐂 Bull Market Mode (Auto-Adjust)
+// ============================
+groupBull = "🐂 Bull Market Mode (Auto-Adjust)"
+bullModeEnable  = input.bool(true,  "Enable", group=groupBull, tooltip="Enable dynamic threshold logic?")
+bullPullbackThr = input.float(35.0, "Bull Pullback Trigger (Default 35)", 0, 100, group=groupBull, tooltip="Trigger level in Bull Regime")
+bullStructThr   = input.float(50.0, "Bull Structure Safety (S5TH >)",     0, 100, group=groupBull, tooltip="S5TH Safety Level required for Bull Mode")
+bullStructExitThr = input.float(45.0, "Bull Exit (S5TH <)",               0, 100, group=groupBull, tooltip="Hysteresis: exit Bull Mode if S5TH drops below this (reduces flip-flop).")
+
+// Trend quality filters (harder regime detection)
+bullTrendBufferPct = input.float(0.5, "Trend Buffer % (SPX > MA200 * (1+x%))", 0.0, 10.0, step=0.1, group=groupBull, tooltip="Avoid flip-flop near MA200. Example: 0.5 means price must be 0.5% above MA200.")
+bullRequireMAUp    = input.bool(true, "Require MA200 Slope Up?", group=groupBull, tooltip="Trend quality: only treat as Bull Trend if MA200 is rising.")
+bullMaSlopeLb      = input.int(20, "MA200 Slope Lookback (days)", minval=1, maxval=200, group=groupBull, tooltip="MA200 must be higher than it was this many days ago.")
+
+// Visuals
+minSpacing  = input.int(3, "Min bars between same-direction arrows", 0, 100)
+calcOnClose = input.bool(true, "Confirm signals on bar close")
+
+// ============================
+// Palette
+// ============================
+colW1 = color.rgb(167, 243, 208)
+colW2 = color.rgb( 52, 211, 153)
+colW3 = color.rgb(  5, 150, 105)
+colH1 = color.rgb(253, 224,  71)
+colH2 = color.rgb(251, 146,  60)
+colH3 = color.rgb(239,  68,  68)
+
+// ============================
+// Helpers
+// ============================
+GAPS = barmerge.gaps_off
+LOOK = barmerge.lookahead_off
+
+f_safe_le(x, thr) => not na(x) and x <= thr
+f_safe_ge(x, thr) => not na(x) and x >= thr
+
+f_yesno(b) => b ? "YES" : "NO"
+
+f_numStr(x, fmt) => na(x) ? "NA" : str.tostring(x, fmt)
+f_pctStr01(x01) => na(x01) ? "NA" : (str.tostring(x01 * 100.0, "#.##") + "%")
+f_pctLevelStr(xPct) => na(xPct) ? "NA" : (str.tostring(xPct, "#.##") + "%")
+
+f_min3(a, b, c) => (na(a) or na(b) or na(c)) ? na : math.min(a, math.min(b, c))
+
+f_secD(sym, expr) =>
+    request.security(sym, "D", expr, gaps=GAPS, lookahead=LOOK)
+
+f_secD_confirmed(sym, expr) =>
+    request.security(sym, "D", ta.valuewhen(barstate.isconfirmed, expr, 0), gaps=GAPS, lookahead=LOOK)
+
+autoPctFactor(src) =>
+    hi = ta.highest(src, 200)
+    (not na(hi) and hi <= 1.01) ? 100.0 : 1.0
+
+// ============================
+// Data Fetching
+// ============================
+// [修改] request.security 改用命名參數（避免版本/簽名變動造成 error）
+spy     = request.security(symSPY, timeframe.period, close)
+// === [A] 所有標住「days」嘅計算一律用日線(D)處理，再投射返落當前 timeframe ===
+vixD    = f_secD(symVIX, close)
+// 兼容：主程式用 vix 呢個名（日線）
+vix = vixD
+
+// SPX daily trend filter (for Bull Market Mode)
+// Use last CONFIRMED daily values to avoid intraday flip-flop on lower timeframes
+spyCloseD     = f_secD_confirmed(symSPY, close)
+spyMA200      = f_secD_confirmed(symSPY, ta.sma(close, 200))
+spyMA200Slope = f_secD_confirmed(symSPY, ta.sma(close, 200) - ta.sma(close, 200)[bullMaSlopeLb])
+
+// External daily closes
+// NOTE: plain `close` on higher-timeframe series can update intraday on lower TF charts.
+// For event-style signals (e.g., VIX Term Recovery), we use "last CONFIRMED daily close" to avoid repaint.
+hygD   = f_secD(symHYG, close)
+tltD   = f_secD(symTLT, close)
+vix3mD = f_secD(symVIX3M, close)
+
+// PCCE (Daily) + Smoothing (Daily)
+cpcD = request.security(
+     symCPC,
+     "D",
+     (cpcSmoothLen > 1) ? ta.ema(close, cpcSmoothLen) : close,
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off
+)
+
+// Breadth scaling (Daily) — 避免 intraday 用 200 bars 當 200 days
+s5twRaw = f_secD(symS5TW, close)
+s5fiRaw = f_secD(symS5FI, close)
+s5thRaw = f_secD(symS5TH, close)
+
+fTW = f_secD(symS5TW, autoPctFactor(close))
+fFI = f_secD(symS5FI, autoPctFactor(close))
+fTH = f_secD(symS5TH, autoPctFactor(close))
+
+s5tw = s5twRaw * fTW
+s5fi = s5fiRaw * fFI
+s5th = s5thRaw * fTH
+
+// ============================
+// Hunter Ultimate Dashboard - Calculations
+// ============================
+// A) De-noised credit spread: HYG/TLT vs EMA20 (Daily)
+spread = (not na(tltD) and tltD != 0) ? (hygD / tltD) : na
+var float spreadMA = na
+spreadLen = 20
+alpha = 2.0 / (spreadLen + 1.0)
+spreadChg = ta.change(spread)
+if na(spreadMA) and not na(spread)
+    spreadMA := spread
+else if not na(spread) and not na(spreadChg) and spreadChg != 0
+    // update only when the daily close steps (prevents intraday EMA distortion)
+    spreadMA := alpha * spread + (1.0 - alpha) * spreadMA
+
+creditRiskOn  = not na(spread) and not na(spreadMA) and spread > spreadMA
+creditRiskOff = not na(spread) and not na(spreadMA) and spread < spreadMA
+
+// B) VIX term structure: VIX / VIX3M (Event-style, non-repainting)
+// Use most recent CONFIRMED daily closes so the ratio doesn't "wiggle" intraday on lower timeframes.
+vixTermCloseD = f_secD_confirmed(symVIX, close)
+vix3mTermD    = f_secD_confirmed(symVIX3M, close)
+vixRatio = (not na(vix3mTermD) and vix3mTermD != 0) ? (vixTermCloseD / vix3mTermD) : na
+vixPanic    = not na(vixRatio) and vixRatio > 1.0
+vixRecovery = ta.crossunder(vixRatio, 1.0)
+vixNormal   = not vixPanic and not vixRecovery and not na(vixRatio)
+
+// Force VIX Recovery plot to be a 1-bar event on the bar where the confirmed daily values "step"
+vixTermChg = ta.change(vixTermCloseD)
+vix3mTermChg = ta.change(vix3mTermD)
+vixStep = (not na(vixTermChg) and vixTermChg != 0) or (not na(vix3mTermChg) and vix3mTermChg != 0)
+vixRecoveryPlot = vixRecovery and vixStep and barstate.isconfirmed
+
+// Mark VIX TERM RECOVERY on chart (blue dot below bar)
+plotshape(
+     vixRecoveryPlot,
+     title="VIX TERM RECOVERY",
+     style=shape.circle,
+     location=location.bottom,
+     color=color.new(color.blue, 0),
+     size=size.tiny
+)
+
+bullBuf = bullTrendBufferPct / 100.0
+maUpOk = not bullRequireMAUp or (not na(spyMA200Slope) and spyMA200Slope > 0)
+isBullTrend = not na(spyCloseD) and not na(spyMA200) and (spyCloseD > spyMA200 * (1 + bullBuf)) and maUpOk
+isBullStructEntry = not na(s5th) and s5th > bullStructThr
+isBullStructExit  = not na(s5th) and s5th < bullStructExitThr
+
+// Bull Mode hysteresis (stateful latch) to prevent flip-flop near thresholds
+bullEntry = bullModeEnable and isBullTrend and isBullStructEntry
+bullExit  = (not bullModeEnable) or (not isBullTrend) or isBullStructExit
+var bool bullModeState = false
+var bool bullModeStateInited = false
+if not bullModeStateInited
+    bullModeState := bullEntry
+    bullModeStateInited := true
+else
+    bullModeState := bullModeState ? not bullExit : bullEntry
+
+isBullMode = bullModeState
+
+activeWeakThr = isBullMode ? bullPullbackThr : weakThrInp
+weakThr = activeWeakThr
+hotThr  = hotThrInp
+
+// ============================
+// Core Logic: Factors
+// ============================
+// VIX rank (Daily)
+vixPct   = request.security(symVIX, "D", ta.percentrank(close, vixLb) / 100.0, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+fear_vix = not na(vixPct) and vixPct >= vixHiPct
+comp_vix = not na(vixPct) and vixPct <= vixLoPct
+
+// PCCE rank (Daily) — 用已平滑嘅日線 series 計 percentile
+cpcPct = request.security(
+     symCPC,
+     "D",
+     ta.percentrank((cpcSmoothLen > 1) ? ta.ema(close, cpcSmoothLen) : close, cpcLb) / 100.0,
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off
+)
+fear_cpc   = (cpcMode == "Absolute") ? (not na(cpcD) and cpcD >  cpcHiAbs) : (not na(cpcPct) and cpcPct >= cpcHiPctRank)
+greedy_cpc = (cpcMode == "Absolute") ? (not na(cpcD) and cpcD <  cpcLoAbs) : (not na(cpcPct) and cpcPct <= cpcLoPctRank)
+
+// ============================
+// Core Logic: Breadth Levels
+// ============================
+wash1_raw = f_safe_le(s5tw, weakThr)
+wash2_raw = wash1_raw and f_safe_le(s5fi, weakThr)
+// Keep wash3 as "crash-level" only (always uses Bear/Crash threshold)
+wash3_raw = wash2_raw and f_safe_le(s5th, weakThrInp)
+
+hot1_raw  = f_safe_ge(s5tw, hotThr)
+hot2_raw  = hot1_raw and f_safe_ge(s5fi, hotThr)
+hot3_raw  = hot2_raw and f_safe_ge(s5th, hotThr)
+
+isH3 = hot3_raw
+isH2 = hot2_raw and not hot3_raw
+isH1 = hot1_raw and not hot2_raw
+
+isW3 = wash3_raw
+isW2 = wash2_raw and not wash3_raw
+isW1 = wash1_raw and not wash2_raw
+
+hot_any  = isH1 or isH2 or isH3
+wash_any = isW1 or isW2 or isW3
+
+// ============================
+// Core Logic: 2-of-3 Trigger
+// ============================
+buyCount       = (wash_any ? 1 : 0) + (fear_vix ? 1 : 0) + (fear_cpc ? 1 : 0)
+buyTriggerRaw  = buyCount >= 2
+buyAll3        = wash_any and fear_vix and fear_cpc
+
+sellCount      = (hot_any ? 1 : 0) + (comp_vix ? 1 : 0) + (greedy_cpc ? 1 : 0)
+sellTriggerRaw = sellCount >= 2
+sellAll3       = hot_any and comp_vix and greedy_cpc
+
+buyTrigger  = calcOnClose ? (buyTriggerRaw  and barstate.isconfirmed) : buyTriggerRaw
+sellTrigger = calcOnClose ? (sellTriggerRaw and barstate.isconfirmed) : sellTriggerRaw
+
+// ============================
+// Spacing
+// ============================
+var int lastBuyBar  = na
+var int lastSellBar = na
+buySpacingOK  = na(lastBuyBar)  or (bar_index - lastBuyBar  > minSpacing)
+sellSpacingOK = na(lastSellBar) or (bar_index - lastSellBar > minSpacing)
+
+buyArrow  = buyTrigger  and (buySpacingOK  or isW3 or buyAll3)
+sellArrow = sellTrigger and (sellSpacingOK or isH3 or sellAll3)
+
+if buyArrow
+    lastBuyBar := bar_index
+if sellArrow
+    lastSellBar := bar_index
+
+// ============================
+// Signal Tiers (Setup vs Strong)
+// ============================
+buySetup  = buyArrow
+sellSetup = sellArrow
+buyStrong  = buyArrow and (buyAll3 or isW3)
+sellStrong = sellArrow and (sellAll3 or isH3)
+
+// ============================
+// Price/VIX Divergence
+// ============================
+groupDiv   = "Price/VIX Divergence"
+showVixDiv = input.bool(true,  "Show Price High + VIX Rise", group=groupDiv)
+vixDivLb   = input.int(20,     "Lookback for Price High (days)", minval=5, group=groupDiv)
+vixMinPct  = input.float(2.5,  "Min VIX Rise % to trigger", minval=0.0, step=0.1, group=groupDiv, tooltip="E.g. 2.5 means VIX rises 2.5% (e.g. 15.0 -> 15.38)")
+divConfirmDailyClose = input.bool(true, "Confirm divergence on DAILY close", group=groupDiv, tooltip="If on, divergence only triggers after the daily bar closes (prevents intraday flip/flop).")
+
+useRsiDivFilter = input.bool(true, "Use RSI Filter?", group=groupDiv)
+rsiDivThr       = input.float(65.0, "Min RSI (14) Level", minval=50, maxval=95, group=groupDiv)
+useRedCandle    = input.bool(true, "Require RED Candle (Rejection)?", group=groupDiv, tooltip="Strict Mode: Only signals if price closes lower than open at new highs.")
+
+// [A] Divergence 全部按日線計（避免 intraday bars 走樣）
+priceNewHighDiv = f_secD(syminfo.tickerid, high >= ta.highest(high, vixDivLb)[1])
+vixRising       = f_secD(symVIX, close >= close[1] * (1 + vixMinPct / 100.0))
+rsiVal          = f_secD(syminfo.tickerid, ta.rsi(close, 14))
+rsiCondition    = not useRsiDivFilter or (rsiVal > rsiDivThr)
+isDailyConfirmed = f_secD(syminfo.tickerid, barstate.isconfirmed)
+candleIsRed      = f_secD(syminfo.tickerid, close < open)
+candleCondition  = not useRedCandle or candleIsRed
+confirmOk        = not divConfirmDailyClose or isDailyConfirmed
+vixDivTrigger    = showVixDiv and confirmOk and priceNewHighDiv and vixRising and rsiCondition and candleCondition
+
+plotshape(vixDivTrigger, title="Price High / VIX Rise", style=shape.circle, location=location.abovebar, color=color.new(color.red, 0), size=size.small)
+
+// ============================
+// Custom EMAs
+// ============================
+groupEMA = "Custom EMAs"
+showEMA1   = input.bool(true,  "Show EMA 1", group=groupEMA, inline="e1")
+ema1Len    = input.int(20,     "Len",  minval=1, maxval=5000, group=groupEMA, inline="e1")
+ema1Src    = input.source(close,"Src", group=groupEMA, inline="e1")
+ema1Color  = input.color(color.orange, "Color", group=groupEMA, inline="e1")
+ema1Width  = input.int(1,      "Width", minval=1, maxval=4, group=groupEMA, inline="e1")
+ema1       = ta.ema(ema1Src, ema1Len)
+plot(showEMA1 ? ema1 : na, title="EMA 1 (custom)", color=ema1Color, linewidth=ema1Width)
+
+showEMA2   = input.bool(true,  "Show EMA 2", group=groupEMA, inline="e2")
+ema2Len    = input.int(50,     "Len",  minval=1, maxval=5000, group=groupEMA, inline="e2")
+ema2Src    = input.source(close,"Src", group=groupEMA, inline="e2")
+ema2Color  = input.color(color.blue, "Color", group=groupEMA, inline="e2")
+ema2Width  = input.int(1,      "Width", minval=1, maxval=4, group=groupEMA, inline="e2")
+ema2       = ta.ema(ema2Src, ema2Len)
+plot(showEMA2 ? ema2 : na, title="EMA 2 (custom)", color=ema2Color, linewidth=ema2Width)
+
+showEMA3   = input.bool(true, "Show EMA 3", group=groupEMA, inline="e3")
+ema3Len    = input.int(200,    "Len",  minval=1, maxval=5000, group=groupEMA, inline="e3")
+ema3Src    = input.source(close, "Src", group=groupEMA, inline="e3")
+ema3Color  = input.color(color.purple, "Color", group=groupEMA, inline="e3")
+ema3Width  = input.int(1,      "Width", minval=1, maxval=4, group=groupEMA, inline="e3")
+ema3       = ta.ema(ema3Src, ema3Len)
+plot(showEMA3 ? ema3 : na, title="EMA 3 (custom)", color=ema3Color, linewidth=ema3Width)
+
+showEMACloud    = input.bool(false, "Show EMA1-EMA2 Cloud", group=groupEMA, inline="c1")
+emaCloudUpCol   = input.color(color.new(color.green, 85), "Up",   group=groupEMA, inline="c1")
+emaCloudDownCol = input.color(color.new(color.red,   85), "Down", group=groupEMA, inline="c1")
+var color emaFillCol = color.new(color.black, 100)
+if showEMACloud
+    emaFillCol := ema1 < ema2 ? emaCloudDownCol : emaCloudUpCol
+ema1Plot = plot(showEMACloud and showEMA1 ? ema1 : na, display=display.none)
+ema2Plot = plot(showEMACloud and showEMA2 ? ema2 : na, display=display.none)
+fill(ema1Plot, ema2Plot, color=emaFillCol)
+
+// ============================
+// Liquidity Sweep (LS) v6.28 - Structural SFP
+// ============================
+groupLS = "Liquidity Sweep (Structure)"
+
+// New Parameters
+lsEnable    = input.bool(true, "Enable Liquidity Sweep (SFP)", group=groupLS)
+lsUseMute   = input.bool(false, "Use Mute (Macro Filter)?", group=groupLS, tooltip="If off, LS signals will not be muted by macro events (3-of-3 / H3+2-of-3).")
+pivotLeft   = input.int(5, "Pivot Left",  minval=1, maxval=50, group=groupLS, inline="pv")
+pivotRight  = input.int(5, "Pivot Right", minval=1, maxval=50, group=groupLS, inline="pv")
+lsLookback  = input.int(60, "Max Lookback (bars)", minval=5, maxval=500, group=groupLS)
+
+// Asymmetrical filters (SFP strength + location)
+lsRsiLen     = input.int(14, "RSI Length", minval=2, maxval=100, group=groupLS, inline="rsi")
+lsBuyRsiMax  = input.float(50.0, "BUY RSI <",  minval=1, maxval=99,  group=groupLS, inline="rsi")
+lsSellRsiMin = input.float(50.0, "SELL RSI >", minval=1, maxval=99,  group=groupLS, inline="rsi")
+
+// Preserve Mute (Macro)
+lsMuteOn3of3          = input.bool(true,  "Mute on 3-of-3 bar",             group=groupLS, inline="m1")
+lsMuteOnH3_2o3        = input.bool(true,  "Mute on H3 + 2-of-3 (SELL) bar", group=groupLS, inline="m1")
+lsMuteDaysAfter3o3    = input.int(50,     "after 3-of-3 (days)",        minval=0, maxval=365, group=groupLS, inline="m2")
+lsMuteDaysAfterH3_2o3 = input.int(50,     "after H3+2-of-3 (days)",     minval=0, maxval=365, group=groupLS, inline="m2")
+
+// --- Pivot Points (Structure) ---
+pl = ta.pivotlow(low,  pivotLeft, pivotRight)
+ph = ta.pivothigh(high, pivotLeft, pivotRight)
+
+var float activeSwingLow  = na
+var float activeSwingHigh = na
+var int   activeSwingLowBar  = na
+var int   activeSwingHighBar = na
+
+// When a new pivot forms, lock it as the active structure point (confirmed pivot)
+if not na(pl)
+    activeSwingLow := pl
+    activeSwingLowBar := bar_index - pivotRight
+if not na(ph)
+    activeSwingHigh := ph
+    activeSwingHighBar := bar_index - pivotRight
+
+// Expire old structure points beyond lookback window
+if not na(activeSwingLowBar) and (bar_index - activeSwingLowBar > lsLookback)
+    activeSwingLow := na
+    activeSwingLowBar := na
+if not na(activeSwingHighBar) and (bar_index - activeSwingHighBar > lsLookback)
+    activeSwingHigh := na
+    activeSwingHighBar := na
+
+// --- SFP Triggers ---
+lsRsi = ta.rsi(close, lsRsiLen)
+
+// BUY: sweep below swing low + reclaim + green candle + RSI low
+sfpBuyRaw  = lsEnable and not na(activeSwingLow)  and (low < activeSwingLow)   and (close > activeSwingLow)  and (close > open) and (lsRsi < lsBuyRsiMax)
+// SELL: sweep above swing high + reclaim + red candle + RSI high
+sfpSellRaw = lsEnable and not na(activeSwingHigh) and (high > activeSwingHigh) and (close < activeSwingHigh) and (close < open) and (lsRsi > lsSellRsiMin)
+
+// --- Mute mechanism (kept) ---
+threeOfThreeEdge = (buyAll3 and not buyAll3[1]) or (sellAll3 and not sellAll3[1])
+h3TwoOf3SellEdge = (isH3 and sellTrigger) and not (isH3[1] and sellTrigger[1])
+
+msPerDay = 24 * 60 * 60 * 1000
+var int lsMuteStart_ts = na
+var int lsMuteEnd_ts   = na
+
+if (lsMuteOn3of3 and threeOfThreeEdge) or (lsMuteOnH3_2o3 and h3TwoOf3SellEdge)
+    extraMs = 0
+    if lsMuteOn3of3 and threeOfThreeEdge
+        extraMs := math.max(extraMs, lsMuteDaysAfter3o3 * msPerDay)
+    if lsMuteOnH3_2o3 and h3TwoOf3SellEdge
+        extraMs := math.max(extraMs, lsMuteDaysAfterH3_2o3 * msPerDay)
+    newStart = time + 1
+    newEnd   = time + extraMs
+    if na(lsMuteEnd_ts) or (newStart > lsMuteEnd_ts)
+        lsMuteStart_ts := newStart
+        lsMuteEnd_ts   := newEnd
+    else
+        lsMuteEnd_ts := math.max(lsMuteEnd_ts, newEnd)
+
+lsWindowMutedNow    = not na(lsMuteEnd_ts) and time >= nz(lsMuteStart_ts, 0) and time <= lsMuteEnd_ts
+lsImmediateMutedNow = (lsMuteOn3of3 and (buyAll3 or sellAll3)) or (lsMuteOnH3_2o3 and (isH3 and sellTrigger))
+lsMuteNow = lsUseMute and (lsWindowMutedNow or lsImmediateMutedNow)
+
+// Final triggers (respect global confirm-on-close)
+lsBuyTrigRaw  = sfpBuyRaw  and not lsMuteNow
+lsSellTrigRaw = sfpSellRaw and not lsMuteNow
+
+lsBuyTrig  = calcOnClose ? (lsBuyTrigRaw  and barstate.isconfirmed) : lsBuyTrigRaw
+lsSellTrig = calcOnClose ? (lsSellTrigRaw and barstate.isconfirmed) : lsSellTrigRaw
+
+// --- Visuals ---
+plotshape(buyArrow and isW1, title="BUY W1", style=shape.triangleup,   location=location.belowbar, color=colW1, size=size.small)
+plotshape(buyArrow and isW2, title="BUY W2", style=shape.triangleup,   location=location.belowbar, color=colW2, size=size.small)
+plotshape(buyArrow and isW3, title="BUY W3", style=shape.triangleup,   location=location.belowbar, color=colW3, size=size.small)
+
+plotshape(sellArrow and isH1, title="SELL H1", style=shape.triangledown, location=location.abovebar, color=colH1, size=size.small)
+plotshape(sellArrow and isH2, title="SELL H2", style=shape.triangledown, location=location.abovebar, color=colH2, size=size.small)
+plotshape(sellArrow and isH3, title="SELL H3", style=shape.triangledown, location=location.abovebar, color=colH3, size=size.small)
+
+plotshape(buyArrow  and buyAll3,  title="BUY 3-of-3",  style=shape.circle, location=location.belowbar, color=color.new(colW3, 0), size=size.tiny)
+plotshape(sellArrow and sellAll3, title="SELL 3-of-3", style=shape.circle, location=location.abovebar, color=color.new(colH3, 0), size=size.tiny)
+
+// LS plots AFTER arrow plots so LS renders on top (prevents LS being hidden by arrows)
+plotshape(lsBuyTrig,  title="LS SFP BUY",  style=shape.xcross, location=location.belowbar, color=color.new(color.lime, 0), size=size.small)
+plotshape(lsSellTrig, title="LS SFP SELL", style=shape.xcross, location=location.abovebar, color=color.new(color.red,  0), size=size.small)
+
+plot(close, title="__anchor__", color=color.new(color.white, 100))
+
+// ============================
+// Hunter Ultimate Dashboard (Table)
+// ============================
+// Dashboard styling
+dashTextSize = size.normal
+dashTableBg  = color.new(color.gray, 90)
+dashHeaderBg = color.new(color.black, 0)
+dashLabelBg  = color.new(color.gray, 50)
+
+var table hunterDash = table.new(
+     position.bottom_right,
+     2,
+     5,
+     border_width=2,
+     bgcolor=dashTableBg
+)
+
+if barstate.islast
+    // Header
+    table.cell(hunterDash, 0, 0, "METRIC", text_color=color.white, bgcolor=dashHeaderBg, text_size=dashTextSize)
+    table.cell(hunterDash, 1, 0, "STATUS", text_color=color.white, bgcolor=dashHeaderBg, text_size=dashTextSize)
+
+    // Row 1: Regime (Bull/Bear)
+    thrStr = f_numStr(activeWeakThr, "#.##")
+    regimeTxt = isBullMode ? ("🐂 BULL (" + thrStr + "%)") : ("🐻 BEAR (" + thrStr + "%)")
+    regimeBg  = isBullMode ? color.new(color.blue, 0) : color.new(color.gray, 0)
+    regimeTip = (
+        "Regime detection (hysteresis):" +
+        "\nSPX > 200SMA (D): " + f_yesno(isBullTrend) +
+        "\nS5TH Entry > " + f_numStr(bullStructThr, "#.##") + "%: " + f_yesno(isBullStructEntry) +
+        "\nS5TH Exit  < " + f_numStr(bullStructExitThr, "#.##") + "%: " + f_yesno(isBullStructExit) +
+        "\nActive washout trigger: " + thrStr + "%"
+    )
+    table.cell(hunterDash, 0, 1, "🌍 REGIME", text_color=color.white, bgcolor=dashLabelBg, tooltip=regimeTip, text_size=dashTextSize)
+    table.cell(hunterDash, 1, 1, regimeTxt,   text_color=color.white, bgcolor=regimeBg,   tooltip=regimeTip, text_size=dashTextSize)
+
+    // Row 2: Main signal (Display matches plotshape logic: requires wash/hot any)
+    // Dashboard now requires wash_any/hot_any to display BUY/SELL (consistent with plotshape)
+    dashBuySignal  = wash_any and buySetup
+    dashSellSignal = hot_any and sellSetup
+    dashBuyStrong  = wash_any and buyStrong
+    dashSellStrong = hot_any and sellStrong
+
+    sigTxt = dashBuySignal ? (dashBuyStrong ? "BUY (STRONG)" : "BUY (SETUP)") : dashSellSignal ? (dashSellStrong ? "SELL (STRONG)" : "SELL (SETUP)") : "WAIT"
+    sigBg  = dashBuySignal ? (dashBuyStrong ? color.new(color.lime, 0) : color.new(color.green, 0)) : dashSellSignal ? (dashSellStrong ? color.new(color.red, 0) : color.new(color.orange, 0)) : color.new(color.gray, 0)
+    vixPctStr = f_pctStr01(vixPct)
+    cpcPctStr = f_pctStr01(cpcPct)
+    bthMin = f_min3(s5tw, s5fi, s5th)
+    bthStr = f_pctLevelStr(bthMin)
+    sigTierStr = dashBuySignal ? (dashBuyStrong ? "BUY STRONG" : "BUY SETUP") : dashSellSignal ? (dashSellStrong ? "SELL STRONG" : "SELL SETUP") : "WAIT"
+    sigTip = (
+        "Tier: " + sigTierStr +
+        "\nCount (BUY/SELL): " + str.tostring(buyCount) + "/" + str.tostring(sellCount) +
+        "\nVIX Rank: " + vixPctStr +
+        "\nPCCE Rank: " + cpcPctStr +
+        "\nBreadth (min %>DMA): " + bthStr +
+        "\nActive Washout Trigger (<=): " + thrStr + "%" +
+        "\nDisplay: Washout/Overheat + (VIX/PCCE)" +
+        "\nStrong: All3 or W3/H3"
+    )
+    table.cell(hunterDash, 0, 2, "🚦 SIGNAL (≤" + thrStr + "%)", text_color=color.white, bgcolor=dashLabelBg, tooltip=sigTip, text_size=dashTextSize)
+    table.cell(hunterDash, 1, 2, sigTxt,                 text_color=color.white, bgcolor=sigBg,      tooltip=sigTip, text_size=dashTextSize)
+
+    // Row 3: Credit (HYG/TLT)
+    spreadStr = f_numStr(spread, "#.###")
+    creditTip = "HYG/TLT Ratio vs EMA20.\nRatio: " + spreadStr + "\nGreen = Healthy Liquidity (Risk On)\nRed = Tight Liquidity (Risk Off)"
+    creditTxt = (
+        na(spread) or na(spreadMA) ? "NA" :
+            creditRiskOn ? ("RISK ON (" + spreadStr + ")") :
+                creditRiskOff ? ("RISK OFF (" + spreadStr + ")") :
+                    ("NEUTRAL (" + spreadStr + ")")
+    )
+    creditBg  = creditRiskOn ? color.new(color.lime, 0) : creditRiskOff ? color.new(color.red, 0) : color.new(color.gray, 0)
+    table.cell(hunterDash, 0, 3, "💰 CREDIT", text_color=color.white, bgcolor=dashLabelBg, tooltip=creditTip, text_size=dashTextSize)
+    table.cell(hunterDash, 1, 3, creditTxt,   text_color=color.white, bgcolor=creditBg,    tooltip=creditTip, text_size=dashTextSize)
+
+    // Row 4: VIX term structure
+    vixTip = "VIX Spot / VIX3M Ratio.\n> 1.0 = Backwardation (Panic)\nDrop below 1.0 = Recovery Signal (Buy opportunity)"
+    ratioStr = f_numStr(vixRatio, "#.###")
+    vixTxt = vixPanic ? ("PANIC (" + ratioStr + ")") : vixRecovery ? "RECOVERY!" : vixNormal ? "NORMAL" : "NA"
+    vixBg  = vixPanic ? color.new(color.red, 0) : vixRecovery ? color.new(color.blue, 0) : vixNormal ? color.new(color.lime, 0) : color.new(color.gray, 0)
+    table.cell(hunterDash, 0, 4, "🌋 VIX TERM", text_color=color.white, bgcolor=dashLabelBg, tooltip=vixTip, text_size=dashTextSize)
+    table.cell(hunterDash, 1, 4, vixTxt,       text_color=color.white, bgcolor=vixBg,       tooltip=vixTip, text_size=dashTextSize)
+
+// ============================
+// Alerts
+// ============================
+alertcondition(buySetup,  title="BUY Setup (2-of-3)",   message="BUY Setup: >=2-of-3 (Breadth washout + (VIX high or PCCE high))")
+alertcondition(buyStrong, title="BUY Strong (All3/W3)", message="BUY Strong: All3 or W3 (strong breadth / full confluence)")
+alertcondition(sellSetup,  title="SELL Setup (2-of-3)",   message="SELL Setup: >=2-of-3 (Breadth overheat + (VIX low or PCCE low))")
+alertcondition(sellStrong, title="SELL Strong (All3/H3)", message="SELL Strong: All3 or H3 (strong breadth / full confluence)")
+alertcondition(lsBuyTrig,  title="LS BUY (SFP)",  message="Liquidity Sweep BUY (SFP): sweep below active swing low then close back above (structural SFP)")
+alertcondition(lsSellTrig, title="LS SELL (SFP)", message="Liquidity Sweep SELL (SFP): sweep above active swing high then close back below (structural SFP)")
+alertcondition(vixDivTrigger, title="VIX Divergence (Price High/VIX Rise)", message="Price made new high but VIX rose (divergence)")
