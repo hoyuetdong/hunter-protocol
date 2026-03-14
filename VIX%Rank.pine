@@ -1,4 +1,4 @@
-//@version=5
+//@version=6
 indicator("VIX Relative Percentiles", overlay=false)
 
 // 設定觀察窗口（例如 126 trading days ≈ 6 個月）

@@ -1,4 +1,4 @@
-//@version=5
+//@version=6
 indicator("Hunter's X-Ray Volume (VSA Logic)", shorttitle="HunterXVol", format=format.volume, overlay=false)
 
 // ============================
